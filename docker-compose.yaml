@@ -1,0 +1,29 @@
+services:
+  importer-cron:
+    image: alpine:latest
+    container_name: linznetz-importer
+    restart: unless-stopped
+    # Install CA certificates to allow SSL connections (Gmail IMAP)
+    # Then start crond in foreground
+    entrypoint: >
+      /bin/sh -c "
+      apk add --no-cache ca-certificates tzdata &&
+      echo \"0 * * * * /usr/local/bin/importer >> /var/log/cron.log 2>&1\" > /etc/crontabs/root &&
+      touch /var/log/cron.log &&
+      crond -f -l 2\"
+    environment:
+      - GMAIL_USER=${GMAIL_USER}
+      - GMAIL_PASSWORD=${GMAIL_PASSWORD}
+      - GMAIL_IMAP_SERVER=imap.gmail.com:993
+      - INFLUX_HOST=${INFLUX_HOST}
+      - INFLUX_PORT=${INFLUX_PORT}
+      - TIMEZONE=Europe/Vienna
+      - MEASUREMENT_NAME=energy_usage
+    configs:
+      - source: importer_bin
+        target: /usr/local/bin/importer
+        mode: 0755
+
+configs:
+  importer_bin:
+    file: ./importer
