@@ -110,9 +110,10 @@ func runMailMode(selectMode, outputMode, measurement string, loc *time.Location,
 		log.Fatalf("Error logging in: %v", err)
 	}
 
-	_, err = c.Select("INBOX", false)
+	gmailLabel := getEnv("GMAIL_LABEL", "linz-netz-tagesbericht")
+	_, err = c.Select(gmailLabel, false)
 	if err != nil {
-		log.Fatalf("Error selecting INBOX: %v", err)
+		log.Fatalf("Error selecting label %s: %v", gmailLabel, err)
 	}
 
 	subjectPrefix := "LINZ NETZ VDI - Tagesbericht Viertelstundenverbrauch"
@@ -150,46 +151,69 @@ func runMailMode(selectMode, outputMode, measurement string, loc *time.Location,
 }
 
 func runUserSelection(c *client.Client, ids []uint32) []uint32 {
-	seqset := new(imap.SeqSet)
-	seqset.AddNum(ids...)
-	
-	messages := make(chan *imap.Message, len(ids))
-	done := make(chan error, 1)
-	go func() {
-		done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags}, messages)
-	}()
+	const pageSize = 20
+	page := 0
 
-	var msgList []*imap.Message
-	for msg := range messages {
-		msgList = append(msgList, msg)
-	}
-	if err := <-done; err != nil {
-		log.Fatal(err)
-	}
+	for {
+		start := page * pageSize
+		if start >= len(ids) { start = len(ids) - pageSize }
+		if start < 0 { start = 0 }
+		
+		end := start + pageSize
+		if end > len(ids) { end = len(ids) }
 
-	fmt.Println("\nAvailable Emails:")
-	for i, m := range msgList {
-		isUnread := true
-		for _, flag := range m.Flags {
-			if flag == imap.SeenFlag {
-				isUnread = false
-				break
-			}
+		pageIDs := ids[start:end]
+		
+		seqset := new(imap.SeqSet)
+		seqset.AddNum(pageIDs...)
+		
+		messages := make(chan *imap.Message, len(pageIDs))
+		done := make(chan error, 1)
+		go func() {
+			done <- c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchFlags}, messages)
+		}()
+
+		var msgList []*imap.Message
+		for msg := range messages {
+			msgList = append(msgList, msg)
 		}
-		unreadMark := "   "
-		if isUnread { unreadMark = "(*)" }
-		subject := shortenSubject(m.Envelope.Subject)
-		fmt.Printf("[%d] %s %s (Date: %s)\n", i, unreadMark, subject, m.Envelope.Date.Format("2006-01-02 15:04"))
-	}
+		if err := <-done; err != nil {
+			log.Fatal(err)
+		}
 
-	fmt.Printf("\nSelect email index (0-%d): ", len(msgList)-1)
-	var selection int
-	fmt.Scanln(&selection)
+		fmt.Printf("\n--- Page %d (Showing %d-%d of %d) ---\n", page+1, start+1, end, len(ids))
+		for i, m := range msgList {
+			isUnread := true
+			for _, flag := range m.Flags {
+				if flag == imap.SeenFlag {
+					isUnread = false
+					break
+				}
+			}
+			unreadMark := "   "
+			if isUnread { unreadMark = "(*)" }
+			subject := shortenSubject(m.Envelope.Subject)
+			fmt.Printf("[%d] %s %s (Date: %s)\n", start+i, unreadMark, subject, m.Envelope.Date.Format("2006-01-02 15:04"))
+		}
 
-	if selection < 0 || selection >= len(msgList) {
-		return nil
+		fmt.Printf("\nOptions: [0-%d] Select, [n] Next, [p] Prev: ", len(ids)-1)
+		var input string
+		fmt.Scanln(&input)
+
+		if input == "n" {
+			if end < len(ids) { page++ }
+			continue
+		} else if input == "p" {
+			if page > 0 { page-- }
+			continue
+		}
+
+		selection, err := strconv.Atoi(input)
+		if err == nil && selection >= 0 && selection < len(ids) {
+			return []uint32{ids[selection]}
+		}
+		fmt.Println("Invalid input.")
 	}
-	return []uint32{msgList[selection].SeqNum}
 }
 
 func shortenSubject(subject string) string {
