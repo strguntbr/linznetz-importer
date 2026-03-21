@@ -31,7 +31,19 @@
 - **Dynamic Configuration**: In interactive mode, the importer prompts for missing required environment variables (e.g., credentials, InfluxDB host) instead of failing immediately.
 - **Secure Input**: Passwords are read without echoing to the terminal for privacy.
 
-### 5. Tooling & CLI
+### 5. Modular Architecture Refactoring
+- **Package Structure**: Refactored the monolith `main.go` into specialized internal packages:
+    - `internal/config`: Configuration, TTY detection, and user prompting.
+    - `internal/exporter`: Decoupled output sinks (InfluxDB, Debug, Diagrams) via the `Exporter` interface.
+    - `internal/models`: Shared data structures.
+    - `internal/parser`: Source-agnostic CSV parsing.
+    - `internal/source`: Data acquisition logic for Web, Mail, and File sources.
+    - `internal/state`: Persistent state management.
+    - `internal/util`: Helper functions and regex utilities.
+- **Maintainability**: Improved code readability and separation of concerns.
+- **Testability**: Updated test suite to verify logic across the new modular structure.
+
+### 6. Tooling & CLI
 - **New Flags**:
   - `--debugBrowserPort`: Connects to an existing browser session.
   - `--meter`: Filters processing to a specific meter ID (works for Web and Mail modes).
