@@ -16,7 +16,7 @@ func TestExtractMeterID(t *testing.T) {
 	}
 
 	// Case 2: ID without 0031... prefix
-	filename2 := "AT00012345_test.csv"
+	filename2 := "AT0031099012345_test.csv"
 	expected2 := "12345"
 	got2 := extractMeterID(filename2)
 	if got2 != expected2 {
@@ -24,7 +24,7 @@ func TestExtractMeterID(t *testing.T) {
 	}
 
 	// Case 3: Empty ID digits
-	filename3 := "AT0000.csv"
+	filename3 := "AT003109900.csv"
 	expected3 := "0"
 	got3 := extractMeterID(filename3)
 	if got3 != expected3 {

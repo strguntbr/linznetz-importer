@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +15,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/chromedp"
+	"github.com/chromedp/cdproto/browser"
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
@@ -26,10 +32,15 @@ type DataPoint struct {
 	Status string
 }
 
+type State struct {
+	LatestDates map[string]time.Time `json:"latest_dates"`
+}
+
 func main() {
 	// 0. Parse command line flags
 	outputMode := flag.String("output", "influx", "Output mode: influx (send via UDP), debug (print line protocol), graphv (vertical diagram), graph (horizontal diagram)")
-	selectMode := flag.String("select", "unread", "Selection mode: unread, latest, user, or file:<path>")
+	selectMode := flag.String("select", "unread", "Selection mode: unread, latest, user, missing, or file:<path>")
+	debugBrowserPort := flag.Int("debugBrowserPort", 0, "Connect to existing browser on this port (remote debugging)")
 	flag.Parse()
 
 	// 1. Setup Timezone
@@ -40,6 +51,9 @@ func main() {
 	}
 
 	measurement := getEnv("MEASUREMENT_NAME", "energy_flow")
+
+	stateFilePath := getEnv("STATE_FILE_PATH", "state.json")
+	state := loadState(stateFilePath)
 
 	// 2. Setup UDP Connection (only if output is influx)
 	var conn *net.UDPConn
@@ -63,15 +77,272 @@ func main() {
 	// 3. Handle Local File Mode
 	if strings.HasPrefix(*selectMode, "file:") {
 		filePath := strings.TrimPrefix(*selectMode, "file:")
-		runFileMode(filePath, *outputMode, measurement, loc, conn)
+		runFileMode(filePath, *outputMode, measurement, loc, conn, state, stateFilePath)
 		return
 	}
 
-	// 4. Handle Gmail/IMAP Modes
-	runMailMode(*selectMode, *outputMode, measurement, loc, conn)
+	// 4. Handle Web Interface Mode
+	if *selectMode == "missing" {
+		runWebMode(*outputMode, measurement, loc, conn, state, stateFilePath, *debugBrowserPort)
+		return
+	}
+
+	// 5. Handle Gmail/IMAP Modes
+	runMailMode(*selectMode, *outputMode, measurement, loc, conn, state, stateFilePath)
 }
 
-func runFileMode(filePath, outputMode, measurement string, loc *time.Location, conn *net.UDPConn) {
+func loadState(path string) *State {
+	s := &State{LatestDates: make(map[string]time.Time)}
+	f, err := os.Open(path)
+	if err != nil {
+		return s
+	}
+	defer f.Close()
+	json.NewDecoder(f).Decode(s)
+	return s
+}
+
+func saveState(path string, s *State) {
+	f, err := os.Create(path)
+	if err != nil {
+		log.Printf("Error saving state: %v", err)
+		return
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	enc.Encode(s)
+}
+func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string, debugPort int) {
+	var allocCtx context.Context
+	var cancel context.CancelFunc
+
+	if debugPort > 0 {
+		remoteURL := fmt.Sprintf("http://localhost:%d", debugPort)
+		log.Printf("Connecting to existing browser on %s...", remoteURL)
+		allocCtx, cancel = chromedp.NewRemoteAllocator(context.Background(), remoteURL)
+	} else {
+		log.Println("Starting standalone headless browser...")
+		opts := append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.NoSandbox,
+			chromedp.Flag("headless", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("disable-extensions", true),
+		)
+		allocCtx, cancel = chromedp.NewExecAllocator(context.Background(), opts...)
+	}
+	defer cancel()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	// 1. Diagnostics: Capture Console Logs
+	chromedp.ListenTarget(ctx, func(ev interface{}) {
+		if ev, ok := ev.(*runtime.EventConsoleAPICalled); ok {
+			for _, arg := range ev.Args {
+				log.Printf("BROWSER CONSOLE: %s", arg.Value)
+			}
+		}
+	})
+
+	// 2. Login
+	username := os.Getenv("LINZNETZ_USER")
+	password := os.Getenv("LINZNETZ_PASSWORD")
+	if username == "" || password == "" {
+		log.Fatal("Missing required environment variables (LINZNETZ_USER, LINZNETZ_PASSWORD) for standalone web mode")
+	}
+
+	log.Println("Performing login...")
+	err := chromedp.Run(ctx,
+		chromedp.Navigate("https://www.linznetz.at/portal/de/home/online_services/serviceportal/mein_serviceportal"),
+		chromedp.WaitVisible("#username", chromedp.ByID),
+		chromedp.SendKeys("#username", username, chromedp.ByID),
+		chromedp.SendKeys("#password", password, chromedp.ByID),
+		chromedp.Click("button[type=\"submit\"]", chromedp.ByQuery),
+		chromedp.WaitVisible("//a[contains(text(), \"Verbrauchsdateninformation\")]", chromedp.BySearch),
+		chromedp.Click("//a[contains(text(), \"Verbrauchsdateninformation\")]", chromedp.BySearch),
+		chromedp.WaitVisible("//a[contains(text(), \"Meine Verbräuche anzeigen\")]", chromedp.BySearch),
+		chromedp.Click("//a[contains(text(), \"Meine Verbräuche anzeigen\")]", chromedp.BySearch),
+	)
+	if err != nil {
+		log.Fatalf("Error during login/navigation: %v", err)
+	}
+
+	err = chromedp.Run(ctx,
+		chromedp.WaitVisible("#myForm1", chromedp.ByQuery),
+	)
+	if err != nil {
+		log.Fatalf("Error waiting for form: %v", err)
+	}
+
+	type MeterInfo struct {
+		RadioID string
+		MeterID string
+		Label   string
+	}
+	meters := []MeterInfo{
+		{"plant-99021", "AT0031000000000000000000990076924", "Basisanlage"},
+		{"plant-115811", "AT0031000000099000000000000017641", "Rücklieferung Photovoltaik"},
+	}
+
+	tmpDir, err := os.MkdirTemp("", "linznetz-csv")
+	if err != nil {
+		log.Fatalf("Error creating temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	yesterday := time.Now().In(loc).AddDate(0, 0, -1)
+	dayBeforeYesterday := yesterday.AddDate(0, 0, -1)
+	todayStr := time.Now().In(loc).Format("02.01.2006")
+
+	for _, m := range meters {
+		log.Printf("Processing meter: %s (%s)", m.MeterID, m.Label)
+
+		fromDate := dayBeforeYesterday
+		if lastDate, ok := state.LatestDates[m.MeterID]; ok && !lastDate.IsZero() {
+			fromDate = lastDate.AddDate(0, 0, 1)
+		} else {
+			state.LatestDates[m.MeterID] = dayBeforeYesterday.AddDate(0, 0, -1)
+			saveState(stateFilePath, state)
+		}
+		
+		if fromDate.After(yesterday) {
+			log.Printf("Meter %s already up to date (%s). Skipping.", m.MeterID, state.LatestDates[m.MeterID].Format("02.01.2006"))
+			continue
+		}
+		
+		fromStr := fromDate.Format("02.01.2006")
+		log.Printf("Selecting meter %s (%s) and requesting data from %s to %s...", m.MeterID, m.Label, fromStr, todayStr)
+
+		var radioVal string
+		var nodes []*cdp.Node
+		err := chromedp.Run(ctx,
+			// 1. Get the value of the radio button
+			chromedp.Value("#"+m.RadioID, &radioVal, chromedp.ByID),
+			// 2. Call selectPlant directly
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				log.Printf("Calling selectPlant('%s') for %s", radioVal, m.Label)
+				return chromedp.Evaluate(fmt.Sprintf("selectPlant('%s')", radioVal), nil).Do(ctx)
+			}),
+			chromedp.Sleep(2*time.Second), // Wait for AJAX updates to settle
+
+			// 3. Set 'Viertelstundenwerte'
+			chromedp.Click("label[for=\"myForm1:j_idt1435:grid_eval:selectedClass:1\"]", chromedp.ByQuery),
+			chromedp.Sleep(1*time.Second),
+
+			// 4. Set Dates
+			chromedp.SetValue("#myForm1\\:calendarFromRegion", fromStr, chromedp.ByQuery),
+			chromedp.Sleep(1*time.Second),
+			chromedp.SetValue("#myForm1\\:calendarToRegion", todayStr, chromedp.ByQuery),
+			chromedp.Sleep(1*time.Second),
+			chromedp.Click("#myForm1\\:btnIdA1", chromedp.ByQuery),
+			chromedp.Sleep(3*time.Second),
+			// Check if export button is present
+			chromedp.Nodes("#myForm1\\:exportAreaID\\:s100\\:button1", &nodes, chromedp.AtLeast(0)),
+		)
+
+		if err != nil {
+			log.Printf("Error processing meter %s: %v", m.MeterID, err)
+			continue
+		}
+
+		if len(nodes) == 0 {
+			log.Printf("No export button found for meter %s. Likely no data for timeframe %s - %s. Skipping.", m.MeterID, fromStr, todayStr)
+			continue
+		}
+
+		log.Printf("Export button found for meter %s. Extracting command...", m.MeterID)
+		
+		var onclick string
+		err = chromedp.Run(ctx,
+			chromedp.AttributeValue("#myForm1\\:exportAreaID\\:s100\\:button1", "onclick", &onclick, nil),
+		)
+		if err != nil || onclick == "" {
+			log.Printf("Could not find onclick handler for meter %s: %v", m.MeterID, err)
+			continue
+		}
+
+		// Replace _blank with _self to stay in the same tab
+		jsCommand := strings.Replace(onclick, "'_blank'", "'_self'", 1)
+		// Strip "return false" as it's illegal in a global Evaluate context
+		jsCommand = strings.Replace(jsCommand, "return false", "", 1)
+		log.Printf("Executing modified command: %s", jsCommand)
+
+		var completed = make(chan bool, 1)
+		chromedp.ListenTarget(ctx, func(ev interface{}) {
+			switch ev := ev.(type) {
+			case *browser.EventDownloadWillBegin:
+				log.Printf("Download will begin: %s (GUID: %s)", ev.SuggestedFilename, ev.GUID)
+			case *browser.EventDownloadProgress:
+				if ev.State == browser.DownloadProgressStateCompleted {
+					log.Printf("Download progress: %s (GUID: %s)", ev.State, ev.GUID)
+					completed <- true
+				} else if ev.State == browser.DownloadProgressStateCanceled {
+					log.Printf("Download progress: %s (GUID: %s)", ev.State, ev.GUID)
+					completed <- false
+				}
+			}
+		})
+
+		err = chromedp.Run(ctx,
+			browser.SetDownloadBehavior(browser.SetDownloadBehaviorBehaviorAllow).WithDownloadPath(tmpDir).WithEventsEnabled(true),
+			chromedp.Evaluate(jsCommand, nil),
+		)
+		if err != nil {
+			log.Printf("Error triggering download for meter %s: %v", m.MeterID, err)
+			continue
+		}
+
+		log.Println("Waiting for download completion event...")
+		downloadDone := false
+		select {
+		case success := <-completed:
+			if success {
+				log.Println("Download event received: Completed.")
+				downloadDone = true
+			} else {
+				log.Printf("Download event received: Canceled.")
+			}
+		case <-time.After(20 * time.Second):
+			log.Printf("Timeout waiting for download event. Checking directory manually...")
+		}
+
+		// Fallback: Poll directory for a few seconds if no event was received
+		if !downloadDone {
+			for i := 0; i < 5; i++ {
+				files, _ := os.ReadDir(tmpDir)
+				if len(files) > 0 {
+					log.Printf("Found %d file(s) in temp dir via polling.", len(files))
+					downloadDone = true
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+		}
+
+		if !downloadDone {
+			log.Printf("Failed to capture download for meter %s.", m.MeterID)
+			continue
+		}
+
+		files, _ := os.ReadDir(tmpDir)
+		for _, f := range files {
+			path := tmpDir + "/" + f.Name()
+			log.Printf("Processing downloaded file: %s (%d bytes)", path, func() int64 { s, _ := os.Stat(path); return s.Size() }())
+			
+			file, err := os.Open(path)
+			if err == nil {
+				points, direction := parseCSVToPoints(file, loc)
+				file.Close()
+				if len(points) > 0 {
+					handleOutput(points, m.MeterID, direction, outputMode, measurement, conn, nil, 0, "missing", state, stateFilePath)
+				}
+			}
+			os.Remove(path)
+		}
+	}
+}
+func runFileMode(filePath, outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		log.Fatalf("Error opening file %s: %v", filePath, err)
@@ -88,10 +359,10 @@ func runFileMode(filePath, outputMode, measurement string, loc *time.Location, c
 		log.Fatal("No data points found in file.")
 	}
 
-	handleOutput(points, meterID, direction, outputMode, measurement, conn, nil, 0, "")
+	handleOutput(points, meterID, direction, outputMode, measurement, conn, nil, 0, "", state, stateFilePath)
 }
 
-func runMailMode(selectMode, outputMode, measurement string, loc *time.Location, conn *net.UDPConn) {
+func runMailMode(selectMode, outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string) {
 	gmailUser := os.Getenv("GMAIL_USER")
 	gmailPass := os.Getenv("GMAIL_PASSWORD")
 	gmailServer := getEnv("GMAIL_IMAP_SERVER", "imap.gmail.com:993")
@@ -146,7 +417,7 @@ func runMailMode(selectMode, outputMode, measurement string, loc *time.Location,
 	}
 
 	for _, id := range selectedIDs {
-		processEmailByID(c, id, outputMode, selectMode, measurement, loc, conn)
+		processEmailByID(c, id, outputMode, selectMode, measurement, loc, conn, state, stateFilePath)
 	}
 }
 
@@ -230,7 +501,7 @@ func shortenSubject(subject string) string {
 	return strings.TrimSpace(s)
 }
 
-func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measurement string, loc *time.Location, conn *net.UDPConn) {
+func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string) {
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(id)
 	
@@ -271,7 +542,7 @@ func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measu
 				if meterID != "" {
 					points, direction := parseCSVToPoints(p.Body, loc)
 					if len(points) > 0 {
-						handleOutput(points, meterID, direction, outputMode, measurement, conn, c, id, selectMode)
+						handleOutput(points, meterID, direction, outputMode, measurement, conn, c, id, selectMode, state, stateFilePath)
 					}
 				}
 			}
@@ -279,9 +550,10 @@ func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measu
 	}
 }
 
-func handleOutput(points []DataPoint, meterID, direction, outputMode, measurement string, conn *net.UDPConn, c *client.Client, emailID uint32, selectMode string) {
+func handleOutput(points []DataPoint, meterID, direction, outputMode, measurement string, conn *net.UDPConn, c *client.Client, emailID uint32, selectMode string, state *State, stateFilePath string) {
 	switch outputMode {
 	case "influx":
+		maxMTime := state.LatestDates[meterID]
 		if conn != nil {
 			for _, p := range points {
 				// Construct fields string
@@ -296,6 +568,12 @@ func handleOutput(points []DataPoint, meterID, direction, outputMode, measuremen
 				line := fmt.Sprintf("%s,meter_id=%s,dir=%s %s %d",
 					measurement, meterID, direction, fields, p.Time.UnixNano())
 				conn.Write([]byte(line + "\n"))
+
+				if p.Status == "M" {
+					if p.Time.After(maxMTime) {
+						maxMTime = p.Time
+					}
+				}
 			}
 			log.Printf("Sent %d points for meter %s (%s).", len(points), meterID, direction)
 		}
@@ -304,6 +582,12 @@ func handleOutput(points []DataPoint, meterID, direction, outputMode, measuremen
 			seqset.AddNum(emailID)
 			c.Store(seqset, imap.FormatFlagsOp(imap.AddFlags, true), []interface{}{imap.SeenFlag}, nil)
 			log.Printf("Email %d marked as read.", emailID)
+		}
+
+		if maxMTime.After(state.LatestDates[meterID]) {
+			state.LatestDates[meterID] = maxMTime
+			saveState(stateFilePath, state)
+			log.Printf("Updated state for meter %s: %v", meterID, maxMTime.Format("2006-01-02 15:04"))
 		}
 	case "debug":
 		for _, p := range points {
@@ -335,9 +619,8 @@ func extractMeterID(filename string) string {
 	re := regexp.MustCompile(`AT(\d+)`)
 	match := re.FindStringSubmatch(filename)
 	if len(match) > 1 {
-		id := match[1]
-		id = strings.TrimPrefix(id, "0031000000099")
-		id = strings.TrimLeft(id, "0")
+		rePrefix := regexp.MustCompile(`^00310+990*`)
+		id := rePrefix.ReplaceAllString(match[1], "")
 		if id == "" {
 			return "0"
 		}
