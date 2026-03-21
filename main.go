@@ -22,7 +22,44 @@ import (
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
+	"golang.org/x/term"
 )
+
+var isInteractive bool
+
+func init() {
+	isInteractive = term.IsTerminal(int(os.Stdin.Fd()))
+}
+
+func requireEnv(key string, sensitive bool) string {
+	val := os.Getenv(key)
+	if val != "" {
+		return val
+	}
+
+	if !isInteractive {
+		log.Fatalf("Missing required environment variable: %s", key)
+	}
+
+	fmt.Printf("Please enter %s: ", key)
+	if sensitive {
+		byteVal, err := term.ReadPassword(int(os.Stdin.Fd()))
+		if err != nil {
+			log.Fatalf("Error reading %s: %v", key, err)
+		}
+		fmt.Println() // Newline after password
+		val = string(byteVal)
+	} else {
+		fmt.Scanln(&val)
+	}
+
+	if val == "" {
+		log.Fatalf("Required environment variable %s cannot be empty.", key)
+	}
+	// Set it so subsequent calls find it
+	os.Setenv(key, val)
+	return val
+}
 
 type DataPoint struct {
 	Time   time.Time
@@ -44,6 +81,10 @@ func main() {
 	meterFlag := flag.String("meter", "", "Specify a single meter ID to process (e.g., AT0031...)")
 	flag.Parse()
 
+	if *selectMode == "user" && !isInteractive {
+		log.Fatal("Selection mode 'user' requires an interactive terminal.")
+	}
+
 	// 1. Setup Timezone
 	tzName := getEnv("TIMEZONE", "Europe/Vienna")
 	loc, err := time.LoadLocation(tzName)
@@ -59,11 +100,8 @@ func main() {
 	// 2. Setup UDP Connection (only if output is influx)
 	var conn *net.UDPConn
 	if *outputMode == "influx" {
-		influxHost := os.Getenv("INFLUX_HOST")
-		influxPort := os.Getenv("INFLUX_PORT")
-		if influxHost == "" || influxPort == "" {
-			log.Fatal("Missing required environment variables (INFLUX_HOST, INFLUX_PORT) for influx output")
-		}
+		influxHost := requireEnv("INFLUX_HOST", false)
+		influxPort := requireEnv("INFLUX_PORT", false)
 		udpAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%s", influxHost, influxPort))
 		if err != nil {
 			log.Fatalf("Error resolving UDP address: %v", err)
@@ -148,11 +186,8 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 
 	// 2. Login
 	if debugPort == 0 {
-		username := os.Getenv("LINZNETZ_USER")
-		password := os.Getenv("LINZNETZ_PASSWORD")
-		if username == "" || password == "" {
-			log.Fatal("Missing required environment variables (LINZNETZ_USER, LINZNETZ_PASSWORD) for standalone web mode")
-		}
+		username := requireEnv("LINZNETZ_USER", false)
+		password := requireEnv("LINZNETZ_PASSWORD", true)
 
 		log.Println("Performing login...")
 		err := chromedp.Run(ctx,
@@ -435,13 +470,9 @@ func runFileMode(filePath, outputMode, measurement string, loc *time.Location, c
 }
 
 func runMailMode(selectMode, outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string, targetMeter string) {
-	gmailUser := os.Getenv("GMAIL_USER")
-	gmailPass := os.Getenv("GMAIL_PASSWORD")
+	gmailUser := requireEnv("GMAIL_USER", false)
+	gmailPass := requireEnv("GMAIL_PASSWORD", true)
 	gmailServer := getEnv("GMAIL_IMAP_SERVER", "imap.gmail.com:993")
-
-	if gmailUser == "" || gmailPass == "" {
-		log.Fatal("Missing required environment variables (GMAIL_USER, GMAIL_PASSWORD)")
-	}
 
 	c, err := client.DialTLS(gmailServer, nil)
 	if err != nil {
