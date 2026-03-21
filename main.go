@@ -41,6 +41,7 @@ func main() {
 	outputMode := flag.String("output", "influx", "Output mode: influx (send via UDP), debug (print line protocol), graphv (vertical diagram), graph (horizontal diagram)")
 	selectMode := flag.String("select", "unread", "Selection mode: unread, latest, user, missing, or file:<path>")
 	debugBrowserPort := flag.Int("debugBrowserPort", 0, "Connect to existing browser on this port (remote debugging)")
+	meterFlag := flag.String("meter", "", "Specify a single meter ID to process (e.g., AT0031...)")
 	flag.Parse()
 
 	// 1. Setup Timezone
@@ -83,12 +84,12 @@ func main() {
 
 	// 4. Handle Web Interface Mode
 	if *selectMode == "missing" {
-		runWebMode(*outputMode, measurement, loc, conn, state, stateFilePath, *debugBrowserPort)
+		runWebMode(*outputMode, measurement, loc, conn, state, stateFilePath, *debugBrowserPort, *meterFlag)
 		return
 	}
 
 	// 5. Handle Gmail/IMAP Modes
-	runMailMode(*selectMode, *outputMode, measurement, loc, conn, state, stateFilePath)
+	runMailMode(*selectMode, *outputMode, measurement, loc, conn, state, stateFilePath, *meterFlag)
 }
 
 func loadState(path string) *State {
@@ -113,7 +114,7 @@ func saveState(path string, s *State) {
 	enc.SetIndent("", "  ")
 	enc.Encode(s)
 }
-func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string, debugPort int) {
+func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string, debugPort int, targetMeter string) {
 	var allocCtx context.Context
 	var cancel context.CancelFunc
 
@@ -136,7 +137,7 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 	ctx, cancel := chromedp.NewContext(allocCtx)
 	defer cancel()
 
-	// 1. Diagnostics: Capture Console Logs
+	// 1. Diagnostics
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		if ev, ok := ev.(*runtime.EventConsoleAPICalled); ok {
 			for _, arg := range ev.Args {
@@ -146,43 +147,103 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 	})
 
 	// 2. Login
-	username := os.Getenv("LINZNETZ_USER")
-	password := os.Getenv("LINZNETZ_PASSWORD")
-	if username == "" || password == "" {
-		log.Fatal("Missing required environment variables (LINZNETZ_USER, LINZNETZ_PASSWORD) for standalone web mode")
+	if debugPort == 0 {
+		username := os.Getenv("LINZNETZ_USER")
+		password := os.Getenv("LINZNETZ_PASSWORD")
+		if username == "" || password == "" {
+			log.Fatal("Missing required environment variables (LINZNETZ_USER, LINZNETZ_PASSWORD) for standalone web mode")
+		}
+
+		log.Println("Performing login...")
+		err := chromedp.Run(ctx,
+			chromedp.Navigate("https://www.linznetz.at/portal/de/home/online_services/serviceportal/mein_serviceportal"),
+			chromedp.WaitVisible("#username", chromedp.ByID),
+			chromedp.SendKeys("#username", username, chromedp.ByID),
+			chromedp.SendKeys("#password", password, chromedp.ByID),
+			chromedp.Click("button[type=\"submit\"]", chromedp.ByQuery),
+			chromedp.WaitVisible("//a[contains(text(), \"Verbrauchsdateninformation\")]", chromedp.BySearch),
+			chromedp.Click("//a[contains(text(), \"Verbrauchsdateninformation\")]", chromedp.BySearch),
+			chromedp.WaitVisible("//a[contains(text(), \"Meine Verbräuche anzeigen\")]", chromedp.BySearch),
+			chromedp.Click("//a[contains(text(), \"Meine Verbräuche anzeigen\")]", chromedp.BySearch),
+		)
+		if err != nil {
+			log.Fatalf("Error during login/navigation: %v", err)
+		}
+	} else {
+		targetURL := "https://services.linznetz.at/verbrauchsdateninformation/consumption.jsf?nav=%2Fde%2Flinz_netz_website%2Fonline_services%2Fserviceportal%2Fmeine_verbraeuche%2Fverbrauchsdateninformation%2Fverbrauchsdateninformation.xhtml"
+		err := chromedp.Run(ctx, chromedp.Navigate(targetURL))
+		if err != nil {
+			log.Fatalf("Error navigating: %v", err)
+		}
 	}
 
-	log.Println("Performing login...")
 	err := chromedp.Run(ctx,
-		chromedp.Navigate("https://www.linznetz.at/portal/de/home/online_services/serviceportal/mein_serviceportal"),
-		chromedp.WaitVisible("#username", chromedp.ByID),
-		chromedp.SendKeys("#username", username, chromedp.ByID),
-		chromedp.SendKeys("#password", password, chromedp.ByID),
-		chromedp.Click("button[type=\"submit\"]", chromedp.ByQuery),
-		chromedp.WaitVisible("//a[contains(text(), \"Verbrauchsdateninformation\")]", chromedp.BySearch),
-		chromedp.Click("//a[contains(text(), \"Verbrauchsdateninformation\")]", chromedp.BySearch),
-		chromedp.WaitVisible("//a[contains(text(), \"Meine Verbräuche anzeigen\")]", chromedp.BySearch),
-		chromedp.Click("//a[contains(text(), \"Meine Verbräuche anzeigen\")]", chromedp.BySearch),
-	)
-	if err != nil {
-		log.Fatalf("Error during login/navigation: %v", err)
-	}
-
-	err = chromedp.Run(ctx,
 		chromedp.WaitVisible("#myForm1", chromedp.ByQuery),
 	)
 	if err != nil {
 		log.Fatalf("Error waiting for form: %v", err)
 	}
 
+	// 3. Dynamic Meter Discovery
 	type MeterInfo struct {
-		RadioID string
-		MeterID string
-		Label   string
+		RadioID string `json:"radio_id"`
+		MeterID string `json:"meter_id"`
+		Label   string `json:"label"`
 	}
-	meters := []MeterInfo{
-		{"plant-99021", "AT0031000000000000000000990076924", "Basisanlage"},
-		{"plant-115811", "AT0031000000099000000000000017641", "Rücklieferung Photovoltaik"},
+	var meters []MeterInfo
+	
+	log.Println("Discovering meters...")
+	err = chromedp.Run(ctx,
+		chromedp.Evaluate(`
+			(function() {
+				// Iterate over all divs with class "row"
+				const rows = Array.from(document.querySelectorAll('div.row'));
+				const discoveredMeters = [];
+				
+				rows.forEach(row => {
+					// Check if this row has exactly one radio input for plantSelection
+					const radios = Array.from(row.querySelectorAll('input[name="plantSelection"]'));
+					if (radios.length === 1) {
+						const r = radios[0];
+						const text = row.innerText + " " + row.textContent;
+						const match = text.match(/AT\d+/);
+						
+						const labelEl = row.querySelector('label[for="' + r.id + '"]') || row.querySelector('label');
+						const label = labelEl ? labelEl.innerText.trim() : "Unknown";
+						
+						discoveredMeters.push({
+							radio_id: r.id,
+							meter_id: match ? match[0] : "",
+							label: label
+						});
+					}
+				});
+				return discoveredMeters;
+			})()
+		`, &meters),
+	)
+	if err != nil {
+		log.Fatalf("Error discovering meters: %v", err)
+	}
+
+	log.Printf("Discovered %d meters.", len(meters))
+	
+	// 4. Filter Meters
+	var metersToProcess []MeterInfo
+	if targetMeter != "" {
+		found := false
+		for _, m := range meters {
+			if m.MeterID == targetMeter {
+				metersToProcess = append(metersToProcess, m)
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Fatalf("Error: Specified meter %s not found in portal.", targetMeter)
+		}
+	} else {
+		metersToProcess = meters
 	}
 
 	tmpDir, err := os.MkdirTemp("", "linznetz-csv")
@@ -192,18 +253,36 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 	defer os.RemoveAll(tmpDir)
 
 	yesterday := time.Now().In(loc).AddDate(0, 0, -1)
-	dayBeforeYesterday := yesterday.AddDate(0, 0, -1)
 	todayStr := time.Now().In(loc).Format("02.01.2006")
 
-	for _, m := range meters {
+	for _, m := range metersToProcess {
+		if m.MeterID == "" {
+			log.Printf("Skipping meter with no ID (Radio: %s, Label: %s)", m.RadioID, m.Label)
+			continue
+		}
+		
 		log.Printf("Processing meter: %s (%s)", m.MeterID, m.Label)
 
-		fromDate := dayBeforeYesterday
+		var fromDate time.Time
+		
+		// 1. Check State
 		if lastDate, ok := state.LatestDates[m.MeterID]; ok && !lastDate.IsZero() {
-			fromDate = lastDate.AddDate(0, 0, 1)
+			fromDate = lastDate
 		} else {
-			state.LatestDates[m.MeterID] = dayBeforeYesterday.AddDate(0, 0, -1)
-			saveState(stateFilePath, state)
+			// 2. Check START_<MeterID>
+			envKey := "START_" + m.MeterID
+			if t := parseDateEnv(envKey, loc); t != nil {
+				fromDate = *t
+			} else {
+				// 3. Check START_DATE
+				if t := parseDateEnv("START_DATE", loc); t != nil {
+					fromDate = *t
+				} else {
+					// 4. Fallback to yesterday
+					fromDate = yesterday
+				}
+			}
+			// Don't persist yet, only after success
 		}
 		
 		if fromDate.After(yesterday) {
@@ -217,27 +296,28 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 		var radioVal string
 		var nodes []*cdp.Node
 		err := chromedp.Run(ctx,
-			// 1. Get the value of the radio button
+			// 1. Get value and select
 			chromedp.Value("#"+m.RadioID, &radioVal, chromedp.ByID),
-			// 2. Call selectPlant directly
 			chromedp.ActionFunc(func(ctx context.Context) error {
-				log.Printf("Calling selectPlant('%s') for %s", radioVal, m.Label)
 				return chromedp.Evaluate(fmt.Sprintf("selectPlant('%s')", radioVal), nil).Do(ctx)
 			}),
-			chromedp.Sleep(2*time.Second), // Wait for AJAX updates to settle
+			chromedp.Sleep(2*time.Second),
 
-			// 3. Set 'Viertelstundenwerte'
+			// 2. Set 'Viertelstundenwerte'
 			chromedp.Click("label[for=\"myForm1:j_idt1435:grid_eval:selectedClass:1\"]", chromedp.ByQuery),
 			chromedp.Sleep(1*time.Second),
 
-			// 4. Set Dates
+			// 3. Set Dates
 			chromedp.SetValue("#myForm1\\:calendarFromRegion", fromStr, chromedp.ByQuery),
 			chromedp.Sleep(1*time.Second),
 			chromedp.SetValue("#myForm1\\:calendarToRegion", todayStr, chromedp.ByQuery),
 			chromedp.Sleep(1*time.Second),
+			
+			// 4. Click Anzeigen
 			chromedp.Click("#myForm1\\:btnIdA1", chromedp.ByQuery),
 			chromedp.Sleep(3*time.Second),
-			// Check if export button is present
+			
+			// Check export button
 			chromedp.Nodes("#myForm1\\:exportAreaID\\:s100\\:button1", &nodes, chromedp.AtLeast(0)),
 		)
 
@@ -247,7 +327,7 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 		}
 
 		if len(nodes) == 0 {
-			log.Printf("No export button found for meter %s. Likely no data for timeframe %s - %s. Skipping.", m.MeterID, fromStr, todayStr)
+			log.Printf("No export button found for meter %s. Likely no data. Skipping.", m.MeterID)
 			continue
 		}
 
@@ -262,23 +342,16 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 			continue
 		}
 
-		// Replace _blank with _self to stay in the same tab
 		jsCommand := strings.Replace(onclick, "'_blank'", "'_self'", 1)
-		// Strip "return false" as it's illegal in a global Evaluate context
 		jsCommand = strings.Replace(jsCommand, "return false", "", 1)
-		log.Printf("Executing modified command: %s", jsCommand)
-
+		
 		var completed = make(chan bool, 1)
 		chromedp.ListenTarget(ctx, func(ev interface{}) {
 			switch ev := ev.(type) {
-			case *browser.EventDownloadWillBegin:
-				log.Printf("Download will begin: %s (GUID: %s)", ev.SuggestedFilename, ev.GUID)
 			case *browser.EventDownloadProgress:
 				if ev.State == browser.DownloadProgressStateCompleted {
-					log.Printf("Download progress: %s (GUID: %s)", ev.State, ev.GUID)
 					completed <- true
 				} else if ev.State == browser.DownloadProgressStateCanceled {
-					log.Printf("Download progress: %s (GUID: %s)", ev.State, ev.GUID)
 					completed <- false
 				}
 			}
@@ -307,7 +380,6 @@ func runWebMode(outputMode, measurement string, loc *time.Location, conn *net.UD
 			log.Printf("Timeout waiting for download event. Checking directory manually...")
 		}
 
-		// Fallback: Poll directory for a few seconds if no event was received
 		if !downloadDone {
 			for i := 0; i < 5; i++ {
 				files, _ := os.ReadDir(tmpDir)
@@ -362,7 +434,7 @@ func runFileMode(filePath, outputMode, measurement string, loc *time.Location, c
 	handleOutput(points, meterID, direction, outputMode, measurement, conn, nil, 0, "", state, stateFilePath)
 }
 
-func runMailMode(selectMode, outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string) {
+func runMailMode(selectMode, outputMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string, targetMeter string) {
 	gmailUser := os.Getenv("GMAIL_USER")
 	gmailPass := os.Getenv("GMAIL_PASSWORD")
 	gmailServer := getEnv("GMAIL_IMAP_SERVER", "imap.gmail.com:993")
@@ -417,7 +489,7 @@ func runMailMode(selectMode, outputMode, measurement string, loc *time.Location,
 	}
 
 	for _, id := range selectedIDs {
-		processEmailByID(c, id, outputMode, selectMode, measurement, loc, conn, state, stateFilePath)
+		processEmailByID(c, id, outputMode, selectMode, measurement, loc, conn, state, stateFilePath, targetMeter)
 	}
 }
 
@@ -501,7 +573,7 @@ func shortenSubject(subject string) string {
 	return strings.TrimSpace(s)
 }
 
-func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string) {
+func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measurement string, loc *time.Location, conn *net.UDPConn, state *State, stateFilePath string, targetMeter string) {
 	seqset := new(imap.SeqSet)
 	seqset.AddNum(id)
 	
@@ -539,6 +611,10 @@ func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measu
 			filename, _ := h.Filename()
 			if strings.HasPrefix(filename, "AT") && strings.HasSuffix(filename, ".csv") {
 				meterID := extractMeterID(filename)
+				if targetMeter != "" && meterID != targetMeter {
+					log.Printf("Skipping email attachment for meter %s (requested: %s)", meterID, targetMeter)
+					continue
+				}
 				if meterID != "" {
 					points, direction := parseCSVToPoints(p.Body, loc)
 					if len(points) > 0 {
@@ -551,32 +627,41 @@ func processEmailByID(c *client.Client, id uint32, outputMode, selectMode, measu
 }
 
 func handleOutput(points []DataPoint, meterID, direction, outputMode, measurement string, conn *net.UDPConn, c *client.Client, emailID uint32, selectMode string, state *State, stateFilePath string) {
+	shortID := shortenMeterID(meterID)
+	
+	// 1. Preparation Phase: Generate lines and calculate maxMTime
+	var lines []string
+	maxMTime := state.LatestDates[meterID]
+	
+	for _, p := range points {
+		fields := fmt.Sprintf("total=%.4f,status=%q", p.Total, p.Status)
+		if p.Rest != nil {
+			fields += fmt.Sprintf(",rest=%.4f", *p.Rest)
+		}
+		if p.EEG != nil {
+			fields += fmt.Sprintf(",eeg=%.4f", *p.EEG)
+		}
+
+		line := fmt.Sprintf("%s,meter_id=%s,dir=%s %s %d",
+			measurement, shortID, direction, fields, p.Time.UnixNano())
+		lines = append(lines, line)
+
+		if p.Status == "M" {
+			if p.Time.After(maxMTime) {
+				maxMTime = p.Time
+			}
+		}
+	}
+
 	switch outputMode {
 	case "influx":
-		maxMTime := state.LatestDates[meterID]
 		if conn != nil {
-			for _, p := range points {
-				// Construct fields string
-				fields := fmt.Sprintf("total=%.4f,status=%q", p.Total, p.Status)
-				if p.Rest != nil {
-					fields += fmt.Sprintf(",rest=%.4f", *p.Rest)
-				}
-				if p.EEG != nil {
-					fields += fmt.Sprintf(",eeg=%.4f", *p.EEG)
-				}
-
-				line := fmt.Sprintf("%s,meter_id=%s,dir=%s %s %d",
-					measurement, meterID, direction, fields, p.Time.UnixNano())
+			for _, line := range lines {
 				conn.Write([]byte(line + "\n"))
-
-				if p.Status == "M" {
-					if p.Time.After(maxMTime) {
-						maxMTime = p.Time
-					}
-				}
 			}
 			log.Printf("Sent %d points for meter %s (%s).", len(points), meterID, direction)
 		}
+		
 		if selectMode == "unread" && c != nil {
 			seqset := new(imap.SeqSet)
 			seqset.AddNum(emailID)
@@ -590,22 +675,34 @@ func handleOutput(points []DataPoint, meterID, direction, outputMode, measuremen
 			log.Printf("Updated state for meter %s: %v", meterID, maxMTime.Format("2006-01-02 15:04"))
 		}
 	case "debug":
-		for _, p := range points {
-			fields := fmt.Sprintf("total=%.4f,status=%q", p.Total, p.Status)
-			if p.Rest != nil {
-				fields += fmt.Sprintf(",rest=%.4f", *p.Rest)
-			}
-			if p.EEG != nil {
-				fields += fmt.Sprintf(",eeg=%.4f", *p.EEG)
-			}
-			fmt.Printf("%s,meter_id=%s,dir=%s %s %d\n",
-				measurement, meterID, direction, fields, p.Time.UnixNano())
+		for _, line := range lines {
+			fmt.Println(line)
+		}
+		
+		if maxMTime.After(state.LatestDates[meterID]) {
+			fmt.Printf("State would be updated for meter %s to: %v\n", meterID, maxMTime.Format("2006-01-02 15:04"))
 		}
 	case "graphv":
 		drawDiagram(points, direction)
 	case "graph":
 		drawHorizontalDiagram(points, direction)
 	}
+}
+
+func parseDateEnv(key string, loc *time.Location) *time.Time {
+	val := os.Getenv(key)
+	if val == "" {
+		return nil
+	}
+	// Try multiple formats
+	formats := []string{"2006-01-02", "02.01.2006"}
+	for _, f := range formats {
+		if t, err := time.ParseInLocation(f, val, loc); err == nil {
+			return &t
+		}
+	}
+	log.Printf("Warning: Invalid date format in %s: %s", key, val)
+	return nil
 }
 
 func getEnv(key, fallback string) string {
@@ -616,8 +713,14 @@ func getEnv(key, fallback string) string {
 }
 
 func extractMeterID(filename string) string {
+	re := regexp.MustCompile(`AT\d+`)
+	match := re.FindString(filename)
+	return match
+}
+
+func shortenMeterID(fullID string) string {
 	re := regexp.MustCompile(`AT(\d+)`)
-	match := re.FindStringSubmatch(filename)
+	match := re.FindStringSubmatch(fullID)
 	if len(match) > 1 {
 		rePrefix := regexp.MustCompile(`^00310+990*`)
 		id := rePrefix.ReplaceAllString(match[1], "")
@@ -626,7 +729,7 @@ func extractMeterID(filename string) string {
 		}
 		return id
 	}
-	return ""
+	return fullID
 }
 
 func parseCSVToPoints(r io.Reader, loc *time.Location) ([]DataPoint, string) {
