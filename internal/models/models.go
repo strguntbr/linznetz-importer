@@ -10,8 +10,13 @@ type DataPoint struct {
 	Status string
 }
 
+type MeterState struct {
+	LatestFinal        time.Time `json:"latest_final"`
+	LatestIntermediate time.Time `json:"latest_intermediate"`
+}
+
 type State struct {
-	LatestDates map[string]time.Time `json:"latest_dates"`
+	Meters map[string]MeterState `json:"meters"`
 }
 
 type MeterInfo struct {

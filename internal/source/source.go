@@ -243,7 +243,34 @@ func processEmailByID(c *client.Client, id uint32, exp exporter.Exporter, loc *t
 
 // --- Web Portal Source ---
 
-func RunWebMode(exp exporter.Exporter, loc *time.Location, s *models.State, stateFilePath string, debugPort int, targetMeter string) {
+func RunWebMode(exp exporter.Exporter, loc *time.Location, s *models.State, stateFilePath string, debugPort int, targetMeter string, force bool) {
+	if !force {
+		if _, err := os.Stat(stateFilePath); err == nil {
+			now := time.Now().In(loc)
+			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+			yesterday := today.AddDate(0, 0, -1)
+			
+			threshold := yesterday
+			if now.Hour() >= 12 {
+				threshold = today
+			}
+
+			if len(s.Meters) > 0 {
+				allUpToDate := true
+				for _, ms := range s.Meters {
+					if ms.LatestIntermediate.Before(threshold) {
+						allUpToDate = false
+						break
+					}
+				}
+				if allUpToDate {
+					log.Printf("All meters in state are up to date (Intermediate >= %s). Skipping download.", threshold.Format("2006-01-02"))
+					return
+				}
+			}
+		}
+	}
+
 	var allocCtx context.Context
 	var cancel context.CancelFunc
 
@@ -258,6 +285,7 @@ func RunWebMode(exp exporter.Exporter, loc *time.Location, s *models.State, stat
 			chromedp.Flag("headless", true),
 			chromedp.Flag("disable-gpu", true),
 			chromedp.Flag("disable-extensions", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
 		)
 		allocCtx, cancel = chromedp.NewExecAllocator(context.Background(), opts...)
 	}
@@ -375,8 +403,9 @@ func RunWebMode(exp exporter.Exporter, loc *time.Location, s *models.State, stat
 		log.Printf("Processing meter: %s (%s)", m.MeterID, m.Label)
 
 		var fromDate time.Time
-		if lastDate, ok := s.LatestDates[m.MeterID]; ok && !lastDate.IsZero() {
-			fromDate = lastDate
+		ms := s.Meters[m.MeterID]
+		if !ms.LatestFinal.IsZero() {
+			fromDate = ms.LatestFinal
 		} else {
 			envKey := "START_" + m.MeterID
 			if t := config.ParseDateEnv(envKey, loc); t != nil {
@@ -391,7 +420,7 @@ func RunWebMode(exp exporter.Exporter, loc *time.Location, s *models.State, stat
 		}
 		
 		if fromDate.After(yesterday) {
-			log.Printf("Meter %s already up to date (%s). Skipping.", m.MeterID, s.LatestDates[m.MeterID].Format("02.01.2006"))
+			log.Printf("Meter %s already up to date (Final %s). Skipping.", m.MeterID, ms.LatestFinal.Format("02.01.2006"))
 			continue
 		}
 		

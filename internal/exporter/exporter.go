@@ -27,7 +27,9 @@ type InfluxUDPExporter struct {
 func (e *InfluxUDPExporter) Export(meterID string, points []models.DataPoint, direction string, s *models.State, stateFilePath string) error {
 	shortID := util.ShortenMeterID(meterID)
 	var lines []string
-	maxMTime := s.LatestDates[meterID]
+	ms := s.Meters[meterID]
+	maxFinal := ms.LatestFinal
+	maxIntermediate := ms.LatestIntermediate
 
 	for _, p := range points {
 		fields := fmt.Sprintf("total=%.4f,status=%q", p.Total, p.Status)
@@ -43,9 +45,12 @@ func (e *InfluxUDPExporter) Export(meterID string, points []models.DataPoint, di
 		lines = append(lines, line)
 
 		if p.Status == "M" {
-			if p.Time.After(maxMTime) {
-				maxMTime = p.Time
+			if p.Time.After(maxFinal) {
+				maxFinal = p.Time
 			}
+		}
+		if p.Time.After(maxIntermediate) {
+			maxIntermediate = p.Time
 		}
 	}
 
@@ -57,12 +62,18 @@ func (e *InfluxUDPExporter) Export(meterID string, points []models.DataPoint, di
 			}
 		}
 		log.Printf("Sent %d points for meter %s (%s).", len(points), meterID, direction)
+	} else {
+		// This is for DebugExporter (which also uses this block if I'm not careful,
+		// but I'll handle it separately below or consolidate)
 	}
 
-	if maxMTime.After(s.LatestDates[meterID]) {
-		s.LatestDates[meterID] = maxMTime
+	if maxFinal.After(ms.LatestFinal) || maxIntermediate.After(ms.LatestIntermediate) {
+		ms.LatestFinal = maxFinal
+		ms.LatestIntermediate = maxIntermediate
+		s.Meters[meterID] = ms
 		state.Save(stateFilePath, s)
-		log.Printf("Updated state for meter %s: %v", meterID, maxMTime.Format("2006-01-02 15:04"))
+		log.Printf("Updated state for meter %s: Final=%v, Intermediate=%v",
+			meterID, maxFinal.Format("2006-01-02 15:04"), maxIntermediate.Format("2006-01-02 15:04"))
 	}
 
 	return nil
@@ -77,7 +88,9 @@ type DebugExporter struct {
 func (e *DebugExporter) Export(meterID string, points []models.DataPoint, direction string, s *models.State, stateFilePath string) error {
 	shortID := util.ShortenMeterID(meterID)
 	var lines []string
-	maxMTime := s.LatestDates[meterID]
+	ms := s.Meters[meterID]
+	maxFinal := ms.LatestFinal
+	maxIntermediate := ms.LatestIntermediate
 
 	for _, p := range points {
 		fields := fmt.Sprintf("total=%.4f,status=%q", p.Total, p.Status)
@@ -93,9 +106,12 @@ func (e *DebugExporter) Export(meterID string, points []models.DataPoint, direct
 		lines = append(lines, line)
 
 		if p.Status == "M" {
-			if p.Time.After(maxMTime) {
-				maxMTime = p.Time
+			if p.Time.After(maxFinal) {
+				maxFinal = p.Time
 			}
+		}
+		if p.Time.After(maxIntermediate) {
+			maxIntermediate = p.Time
 		}
 	}
 
@@ -103,8 +119,9 @@ func (e *DebugExporter) Export(meterID string, points []models.DataPoint, direct
 		fmt.Println(line)
 	}
 
-	if maxMTime.After(s.LatestDates[meterID]) {
-		fmt.Printf("State would be updated for meter %s to: %v\n", meterID, maxMTime.Format("2006-01-02 15:04"))
+	if maxFinal.After(ms.LatestFinal) || maxIntermediate.After(ms.LatestIntermediate) {
+		fmt.Printf("State would be updated for meter %s to: Final=%v, Intermediate=%v\n",
+			meterID, maxFinal.Format("2006-01-02 15:04"), maxIntermediate.Format("2006-01-02 15:04"))
 	}
 
 	return nil

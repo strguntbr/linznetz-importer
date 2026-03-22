@@ -28,7 +28,13 @@ A "one-shot" CLI tool to import energy consumption data from Linz Netz CSV repor
 - `unread` (Default): Processes all matching unread emails in the inbox.
 - `latest`: Processes only the most recent matching email (regardless of read status). Never marks as read.
 - `user`: Interactive mode. Lists all matching emails (unread marked with `(*)`) and prompts for selection. Never marks as read.
-- `file:<path>`: Skips Gmail entirely and processes the local file at the specified path.
+- `missing`: Automates logging into the Linz Netz portal and downloading missing data for all discovered meters.
+- `file:<path>`: Skips Gmail/Portal entirely and processes the local file at the specified path.
+
+### CLI Parameters
+- `--meter <AT...>`: Filters processing to a specific meter ID (works for Web and Mail modes).
+- `--force`: Bypasses the skip logic in `missing` mode and forces a download from the portal.
+- `--debugBrowserPort <port>`: Connects to an existing browser session for remote debugging.
 
 ### `--output` (Result Destination)
 - `influx` (Default): Sends data points to InfluxDB via UDP. Marks emails as read *only* if `--select=unread`.

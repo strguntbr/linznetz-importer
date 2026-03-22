@@ -1,13 +1,21 @@
 # Linz Netz Importer - Project Progress (March 21, 2026)
 
 ## Completed Tasks
-
 ### 1. State Persistence
-- **State Struct**: Tracks `LatestDates` for each meter using the full `AT...` ID as the key.
+- **State Struct**: Tracks `LatestFinal` and `LatestIntermediate` for each meter using the full `AT...` ID as the key in a `Meters` map.
 - **JSON Storage**: Persisted in `state.json` (configurable via `STATE_FILE_PATH`).
-- **Logic**: Updated only for "M" (valid) status data points during InfluxDB or Debug output.
+- **Logic**: 
+    - `LatestFinal`: Updated only for "M" (valid/final) status data points.
+    - `LatestIntermediate`: Updated for all data points (newest data received).
 
 ### 2. Web Portal Automation (`runWebMode`)
+- **Skip Logic**: 
+    - Automatically skips download if data is already up to date based on the time of day.
+    - Before 12:00 CET: Skips if `LatestIntermediate` is from yesterday or newer (meaning we have data for the day before yesterday).
+    - After 12:00 CET: Skips if `LatestIntermediate` is from today or newer (meaning we have data for yesterday).
+    - Bypassed if `--force` is used or if the state file is missing.
+- **Dynamic Meter Discovery**: ...
+
 - **Dynamic Meter Discovery**: Automatically iterates through all meters found in the portal by correlating radio buttons with `AT...` IDs in the same row. Hardcoded mappings removed.
 - **Robust Downloads**:
   - Overrides `_blank` targets to `_self` via monkey-patching and direct JavaScript execution (`mojarra.cljs`).
@@ -43,7 +51,14 @@
 - **Maintainability**: Improved code readability and separation of concerns.
 - **Testability**: Updated test suite to verify logic across the new modular structure.
 
-### 6. Tooling & CLI
+### 6. Docker & Containerization
+- **Base Image**: Switched to `zenika/alpine-chrome:latest`, which includes Chromium and CA certificates pre-installed.
+- **Security**: The container now runs as the non-privileged `chrome` user.
+- **Execution Model**: Replaced complex `crond` setup with a simple shell loop (`while true`) for periodic imports.
+- **Persistence**: Implemented Docker volumes (`./data:/data`) to persist `state.json` across container restarts.
+- **Stability**: Added `disable-dev-shm-usage` flag to `chromedp` to prevent crashes in container environments.
+
+### 7. Tooling & CLI
 - **New Flags**:
   - `--debugBrowserPort`: Connects to an existing browser session.
   - `--meter`: Filters processing to a specific meter ID (works for Web and Mail modes).

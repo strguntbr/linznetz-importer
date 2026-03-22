@@ -4,19 +4,21 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"time"
 
 	"linznetz-import/internal/models"
 )
 
 func Load(path string) *models.State {
-	s := &models.State{LatestDates: make(map[string]time.Time)}
+	s := &models.State{Meters: make(map[string]models.MeterState)}
 	f, err := os.Open(path)
 	if err != nil {
 		return s
 	}
 	defer f.Close()
 	json.NewDecoder(f).Decode(s)
+	if s.Meters == nil {
+		s.Meters = make(map[string]models.MeterState)
+	}
 	return s
 }
 

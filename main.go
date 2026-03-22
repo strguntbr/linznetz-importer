@@ -21,6 +21,7 @@ func main() {
 	selectMode := flag.String("select", "unread", "Selection mode: unread, latest, user, missing, or file:<path>")
 	debugBrowserPort := flag.Int("debugBrowserPort", 0, "Connect to existing browser on this port (remote debugging)")
 	meterFlag := flag.String("meter", "", "Specify a single meter ID to process (e.g., AT0031...)")
+	forceFlag := flag.Bool("force", false, "Force download even if data is up to date")
 	flag.Parse()
 
 	if *selectMode == "user" && !config.IsInteractive {
@@ -78,7 +79,7 @@ func main() {
 	}
 
 	if *selectMode == "missing" {
-		source.RunWebMode(exp, loc, s, stateFilePath, *debugBrowserPort, *meterFlag)
+		source.RunWebMode(exp, loc, s, stateFilePath, *debugBrowserPort, *meterFlag, *forceFlag)
 		return
 	}
 
