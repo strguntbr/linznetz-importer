@@ -50,6 +50,9 @@
     - `internal/util`: Helper functions and regex utilities.
 - **Maintainability**: Improved code readability and separation of concerns.
 - **Testability**: Updated test suite to verify logic across the new modular structure.
+    - Added unit tests for `ShouldSkipDownload` logic in `internal/source`.
+    - Added unit tests for state updates in `internal/exporter`.
+    - Added unit tests for state persistence in `internal/state`.
 
 ### 6. Docker & Containerization
 - **Base Image**: Switched to `zenika/alpine-chrome:latest`, which includes Chromium and CA certificates pre-installed.

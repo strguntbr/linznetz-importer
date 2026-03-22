@@ -241,34 +241,42 @@ func processEmailByID(c *client.Client, id uint32, exp exporter.Exporter, loc *t
 	}
 }
 
+func ShouldSkipDownload(s *models.State, stateFilePath string, loc *time.Location, now time.Time, force bool) bool {
+	if force {
+		return false
+	}
+
+	if _, err := os.Stat(stateFilePath); err != nil {
+		return false
+	}
+
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	yesterday := today.AddDate(0, 0, -1)
+
+	threshold := yesterday
+	if now.Hour() >= 12 {
+		threshold = today
+	}
+
+	if len(s.Meters) == 0 {
+		return false
+	}
+
+	for _, ms := range s.Meters {
+		if ms.LatestIntermediate.Before(threshold) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // --- Web Portal Source ---
 
 func RunWebMode(exp exporter.Exporter, loc *time.Location, s *models.State, stateFilePath string, debugPort int, targetMeter string, force bool) {
-	if !force {
-		if _, err := os.Stat(stateFilePath); err == nil {
-			now := time.Now().In(loc)
-			today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
-			yesterday := today.AddDate(0, 0, -1)
-			
-			threshold := yesterday
-			if now.Hour() >= 12 {
-				threshold = today
-			}
-
-			if len(s.Meters) > 0 {
-				allUpToDate := true
-				for _, ms := range s.Meters {
-					if ms.LatestIntermediate.Before(threshold) {
-						allUpToDate = false
-						break
-					}
-				}
-				if allUpToDate {
-					log.Printf("All meters in state are up to date (Intermediate >= %s). Skipping download.", threshold.Format("2006-01-02"))
-					return
-				}
-			}
-		}
+	if ShouldSkipDownload(s, stateFilePath, loc, time.Now().In(loc), force) {
+		log.Printf("All meters in state are up to date. Skipping download.")
+		return
 	}
 
 	var allocCtx context.Context

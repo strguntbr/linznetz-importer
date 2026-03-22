@@ -120,6 +120,9 @@ func (e *DebugExporter) Export(meterID string, points []models.DataPoint, direct
 	}
 
 	if maxFinal.After(ms.LatestFinal) || maxIntermediate.After(ms.LatestIntermediate) {
+		ms.LatestFinal = maxFinal
+		ms.LatestIntermediate = maxIntermediate
+		s.Meters[meterID] = ms
 		fmt.Printf("State would be updated for meter %s to: Final=%v, Intermediate=%v\n",
 			meterID, maxFinal.Format("2006-01-02 15:04"), maxIntermediate.Format("2006-01-02 15:04"))
 	}
