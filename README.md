@@ -16,11 +16,15 @@ A "one-shot" CLI tool to import energy consumption data from Linz Netz CSV repor
 | :--- | :--- | :---: | :--- |
 | `GMAIL_USER` | Gmail email address | Yes (for Mail mode) | - |
 | `GMAIL_PASSWORD` | Gmail App Password | Yes (for Mail mode) | - |
+| `LINZNETZ_USER` | Linz Netz Portal username | Yes (for Web mode) | - |
+| `LINZNETZ_PASSWORD` | Linz Netz Portal password | Yes (for Web mode) | - |
 | `GMAIL_IMAP_SERVER`| IMAP server address | No | `imap.gmail.com:993` |
 | `INFLUX_HOST` | Target host for InfluxDB UDP | Yes (for Influx mode) | - |
 | `INFLUX_PORT` | Target port for InfluxDB UDP | Yes (for Influx mode) | - |
 | `TIMEZONE` | Timezone for CSV timestamps | No | `Europe/Vienna` |
 | `MEASUREMENT_NAME` | InfluxDB measurement name | No | `energy_usage` |
+
+> **Docker Secrets Support**: All environment variables also support a `_FILE` suffix (e.g., `GMAIL_PASSWORD_FILE`). If set, the importer will read the value from the specified file. This is useful for passing secrets via Docker Secrets or Kubernetes secrets. If both the direct variable and the `_FILE` variable are set, the direct variable takes precedence.
 
 ## CLI Parameters
 

@@ -1,14 +1,26 @@
 package util
 
 import (
+	"log"
 	"os"
 	"regexp"
+	"strings"
 )
 
 func GetEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
+	if value, ok := os.LookupEnv(key); ok && value != "" {
 		return value
 	}
+	
+	if filePath, ok := os.LookupEnv(key + "_FILE"); ok && filePath != "" {
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			log.Printf("Warning: Error reading secret from file %s (specified via %s_FILE): %v", filePath, key, err)
+			return fallback
+		}
+		return strings.TrimSpace(string(content))
+	}
+	
 	return fallback
 }
 

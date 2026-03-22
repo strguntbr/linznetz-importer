@@ -6,6 +6,8 @@ import (
 	"os"
 	"time"
 
+	"linznetz-import/internal/util"
+
 	"golang.org/x/term"
 )
 
@@ -16,13 +18,13 @@ func init() {
 }
 
 func RequireEnv(key string, sensitive bool) string {
-	val := os.Getenv(key)
+	val := util.GetEnv(key, "")
 	if val != "" {
 		return val
 	}
 
 	if !IsInteractive {
-		log.Fatalf("Missing required environment variable: %s", key)
+		log.Fatalf("Missing required environment variable: %s (or %s_FILE)", key, key)
 	}
 
 	fmt.Printf("Please enter %s: ", key)
@@ -45,7 +47,7 @@ func RequireEnv(key string, sensitive bool) string {
 }
 
 func ParseDateEnv(key string, loc *time.Location) *time.Time {
-	val := os.Getenv(key)
+	val := util.GetEnv(key, "")
 	if val == "" {
 		return nil
 	}

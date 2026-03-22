@@ -35,6 +35,7 @@
 
 ### 4. Interactive Features & Safety
 - **TTY Detection**: Uses `golang.org/x/term` to detect if the importer is running in an interactive terminal.
+- **Docker Secrets Support**: All environment variables now support a `_FILE` suffix (e.g., `LINZNETZ_PASSWORD_FILE`) to read secrets from files. Direct environment variables take precedence.
 - **Safety Check**: Prevents `--select=user` from running in non-interactive environments (e.g., cron jobs, pipes).
 - **Dynamic Configuration**: In interactive mode, the importer prompts for missing required environment variables (e.g., credentials, InfluxDB host) instead of failing immediately.
 - **Secure Input**: Passwords are read without echoing to the terminal for privacy.
