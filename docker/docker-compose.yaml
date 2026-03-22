@@ -1,0 +1,44 @@
+version: '3.8'
+services:
+  importer:
+    image: zenika/alpine-chrome:124
+    container_name: linznetz-importer
+    user: chrome
+    restart: unless-stopped
+    entrypoint: /usr/local/bin/supercronic /home/chrome/crontab
+    environment:
+      - LINZNETZ_USER_FILE=/run/secrets/linznetz_user
+      - LINZNETZ_PASSWORD_FILE=/run/secrets/linznetz_password
+      - INFLUX_HOST=192.168.100.251
+      - INFLUX_PORT=8092
+      - STATE_FILE_PATH=/data/state.json
+      - TIMEZONE=Europe/Vienna
+      - MEASUREMENT_NAME=energy_usage
+      - START_DATE=19.03.2026
+    volumes:
+      - ./data:/data
+    configs:
+      - source: importer_bin
+        target: /usr/local/bin/importer
+        mode: 0755
+      - source: supercronic_bin
+        target: /usr/local/bin/supercronic
+        mode: 0755
+      - source: crontab
+        target: /home/chrome/crontab
+        mode: 0644
+
+secrets:
+  linznetz_user:
+    external: true
+  linznetz_password:
+    external: true
+
+configs:
+  importer_bin:
+    file: ./importer
+  supercronic_bin:
+    # https://github.com/aptible/supercronic
+    file: ./supercronic-linux-amd64_v0.2.44
+  crontab:
+    file: ./crontab

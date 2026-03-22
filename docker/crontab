@@ -1,0 +1,2 @@
+# Run once every hour
+@hourly /usr/local/bin/importer --select=missing
